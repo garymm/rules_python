@@ -17,9 +17,36 @@ workspace(name = "rules_python")
 # Everything below this line is used only for developing rules_python. Users
 # should not copy it to their WORKSPACE.
 
-load("//:internal_deps.bzl", "rules_python_internal_deps")
+# Necessary so that Bazel 9 recognizes this as rules_python and doesn't try
+# to load the version Bazel itself uses by default.
+# buildifier: disable=duplicated-name
+local_repository(
+    name = "rules_python",
+    path = ".",
+)
+
+load("//:internal_dev_deps.bzl", "rules_python_internal_deps")
 
 rules_python_internal_deps()
+
+load("@rules_java//java:rules_java_deps.bzl", "rules_java_dependencies")
+
+rules_java_dependencies()
+
+# note that the following line is what is minimally required from protobuf for the java rules
+# consider using the protobuf_deps() public API from @com_google_protobuf//:protobuf_deps.bzl
+load("@com_google_protobuf//bazel/private:proto_bazel_features.bzl", "proto_bazel_features")  # buildifier: disable=bzl-visibility
+
+proto_bazel_features(name = "proto_bazel_features")
+
+# register toolchains
+load("@rules_java//java:repositories.bzl", "rules_java_toolchains")
+
+rules_java_toolchains()
+
+load("@com_google_protobuf//:protobuf_deps.bzl", "protobuf_deps")
+
+protobuf_deps()
 
 load("@rules_jvm_external//:repositories.bzl", "rules_jvm_external_deps")
 
@@ -37,17 +64,18 @@ load("@stardoc_maven//:defs.bzl", stardoc_pinned_maven_install = "pinned_maven_i
 
 stardoc_pinned_maven_install()
 
-load("//:internal_setup.bzl", "rules_python_internal_setup")
+load("//:internal_dev_setup.bzl", "rules_python_internal_setup")
 
 rules_python_internal_setup()
 
+load("@pythons_hub//:versions.bzl", "MINOR_MAPPING", "PYTHON_VERSIONS")
 load("//python:repositories.bzl", "python_register_multi_toolchains")
-load("//python:versions.bzl", "MINOR_MAPPING")
 
 python_register_multi_toolchains(
     name = "python",
-    default_version = MINOR_MAPPING.values()[-2],
-    python_versions = MINOR_MAPPING.values(),
+    default_version = MINOR_MAPPING.values()[-3],  # Use 3.11.10
+    # Integration tests verify each version, so register all of them.
+    python_versions = PYTHON_VERSIONS,
 )
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
@@ -85,7 +113,7 @@ load("@rules_python_gazelle_plugin//:deps.bzl", _py_gazelle_deps = "gazelle_deps
 _py_gazelle_deps()
 
 # This interpreter is used for various rules_python dev-time tools
-load("@python//3.11.7:defs.bzl", "interpreter")
+interpreter = "@python_3_11_9_host//:python"
 
 #####################
 # Install twine for our own runfiles wheel publishing.
@@ -94,34 +122,34 @@ load("@python//3.11.7:defs.bzl", "interpreter")
 load("@rules_python//python:pip.bzl", "pip_parse")
 
 pip_parse(
-    name = "publish_deps",
+    name = "rules_python_publish_deps",
     python_interpreter_target = interpreter,
     requirements_darwin = "//tools/publish:requirements_darwin.txt",
-    requirements_lock = "//tools/publish:requirements.txt",
+    requirements_lock = "//tools/publish:requirements_linux.txt",
     requirements_windows = "//tools/publish:requirements_windows.txt",
 )
 
-load("@publish_deps//:requirements.bzl", "install_deps")
+load("@rules_python_publish_deps//:requirements.bzl", "install_deps")
 
 install_deps()
+
+pip_parse(
+    name = "pypiserver",
+    python_interpreter_target = interpreter,
+    requirements_lock = "//examples/wheel:requirements_server.txt",
+)
+
+load("@pypiserver//:requirements.bzl", install_pypiserver = "install_deps")
+
+install_pypiserver()
 
 #####################
 # Install sphinx for doc generation.
 
 pip_parse(
     name = "dev_pip",
-    experimental_requirement_cycles = {
-        "sphinx": [
-            "sphinx",
-            "sphinxcontrib-serializinghtml",
-            "sphinxcontrib-qthelp",
-            "sphinxcontrib-htmlhelp",
-            "sphinxcontrib-devhelp",
-            "sphinxcontrib-applehelp",
-        ],
-    },
     python_interpreter_target = interpreter,
-    requirements_lock = "//docs/sphinx:requirements.txt",
+    requirements_lock = "//docs:requirements.txt",
 )
 
 load("@dev_pip//:requirements.bzl", docs_install_deps = "install_deps")

@@ -58,13 +58,24 @@ class _ManifestBased:
         result = {}
         with open(path, "r") as f:
             for line in f:
-                line = line.strip()
-                if line:
-                    tokens = line.split(" ", 1)
-                    if len(tokens) == 1:
-                        result[line] = line
-                    else:
-                        result[tokens[0]] = tokens[1]
+                line = line.rstrip("\n")
+                if line.startswith(" "):
+                    # In lines that start with a space, spaces, newlines, and backslashes are escaped as \s, \n, and \b in
+                    # link and newlines and backslashes are escaped in target.
+                    escaped_link, escaped_target = line[1:].split(" ", maxsplit=1)
+                    link = (
+                        escaped_link.replace(r"\s", " ")
+                        .replace(r"\n", "\n")
+                        .replace(r"\b", "\\")
+                    )
+                    target = escaped_target.replace(r"\n", "\n").replace(r"\b", "\\")
+                else:
+                    link, target = line.split(" ", maxsplit=1)
+
+                if target:
+                    result[link] = target
+                else:
+                    result[link] = link
         return result
 
     def _GetRunfilesDir(self) -> str:
@@ -247,6 +258,20 @@ class Runfiles:
             raise ValueError("failed to determine caller's file path") from exc
         caller_runfiles_path = os.path.relpath(caller_path, self._python_runfiles_root)
         if caller_runfiles_path.startswith(".." + os.path.sep):
+            # With Python 3.10 and earlier, sys.path contains the directory
+            # of the script, which can result in a module being loaded from
+            # outside the runfiles tree. In this case, assume that the module is
+            # located in the main repository.
+            # With Python 3.11 and higher, the Python launcher sets
+            # PYTHONSAFEPATH, which prevents this behavior.
+            # TODO: This doesn't cover the case of a script being run from an
+            #       external repository, which could be heuristically detected
+            #       by parsing the script's path.
+            if (
+                sys.version_info.minor <= 10
+                and sys.path[0] != self._python_runfiles_root
+            ):
+                return ""
             raise ValueError(
                 "{} does not lie under the runfiles root {}".format(
                     caller_path, self._python_runfiles_root

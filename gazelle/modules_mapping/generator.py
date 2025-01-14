@@ -25,16 +25,25 @@ class Generator:
     stderr = None
     output_file = None
     excluded_patterns = None
-    mapping = {}
 
-    def __init__(self, stderr, output_file, excluded_patterns):
+    def __init__(self, stderr, output_file, excluded_patterns, include_stub_packages):
         self.stderr = stderr
         self.output_file = output_file
         self.excluded_patterns = [re.compile(pattern) for pattern in excluded_patterns]
+        self.include_stub_packages = include_stub_packages
+        self.mapping = {}
 
     # dig_wheel analyses the wheel .whl file determining the modules it provides
     # by looking at the directory structure.
     def dig_wheel(self, whl):
+        # Skip stubs and types wheels.
+        wheel_name = get_wheel_name(whl)
+        if self.include_stub_packages and (
+            wheel_name.endswith(("_stubs", "_types"))
+            or wheel_name.startswith(("types_", "stubs_"))
+        ):
+            self.mapping[wheel_name.lower()] = wheel_name.lower()
+            return
         with zipfile.ZipFile(whl, "r") as zip_file:
             for path in zip_file.namelist():
                 if is_metadata(path):
@@ -44,6 +53,23 @@ class Generator:
                         continue
                 else:
                     self.module_for_path(path, whl)
+
+    def simplify(self):
+        simplified = {}
+        for module, wheel_name in sorted(self.mapping.items(), key=lambda x: x[0]):
+            mod = module
+            while True:
+                if mod in simplified:
+                    if simplified[mod] != wheel_name:
+                        break
+                    wheel_name = ""
+                    break
+                if mod.count(".") == 0:
+                    break
+                mod = mod.rsplit(".", 1)[0]
+            if wheel_name:
+                simplified[module] = wheel_name
+        self.mapping = simplified
 
     def module_for_path(self, path, whl):
         ext = pathlib.Path(path).suffix
@@ -70,7 +96,8 @@ class Generator:
                 ext = "".join(pathlib.Path(root).suffixes)
             module = root[: -len(ext)].replace("/", ".")
             if not self.is_excluded(module):
-                self.mapping[module] = wheel_name
+                if not self.is_excluded(module):
+                    self.mapping[module] = wheel_name
 
     def is_excluded(self, module):
         for pattern in self.excluded_patterns:
@@ -86,6 +113,7 @@ class Generator:
             except AssertionError as error:
                 print(error, file=self.stderr)
                 return 1
+        self.simplify()
         mapping_json = json.dumps(self.mapping)
         with open(self.output_file, "w") as f:
             f.write(mapping_json)
@@ -126,8 +154,11 @@ if __name__ == "__main__":
         description="Generates the modules mapping used by the Gazelle manifest.",
     )
     parser.add_argument("--output_file", type=str)
+    parser.add_argument("--include_stub_packages", action="store_true")
     parser.add_argument("--exclude_patterns", nargs="+", default=[])
     parser.add_argument("--wheels", nargs="+", default=[])
     args = parser.parse_args()
-    generator = Generator(sys.stderr, args.output_file, args.exclude_patterns)
+    generator = Generator(
+        sys.stderr, args.output_file, args.exclude_patterns, args.include_stub_packages
+    )
     exit(generator.run(args.wheels))

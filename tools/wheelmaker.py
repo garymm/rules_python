@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import hashlib
+import io
 import os
 import re
 import stat
@@ -102,12 +104,13 @@ class _WhlFile(zipfile.ZipFile):
         filename,
         *,
         mode,
-        distinfo_dir: str | Path,
+        distribution_prefix: str,
         strip_path_prefixes=None,
         compression=zipfile.ZIP_DEFLATED,
         **kwargs,
     ):
-        self._distinfo_dir: str = Path(distinfo_dir).name
+        self._distribution_prefix = distribution_prefix
+
         self._strip_path_prefixes = strip_path_prefixes or []
         # Entries for the RECORD file as (filename, hash, size) tuples.
         self._record = []
@@ -115,7 +118,10 @@ class _WhlFile(zipfile.ZipFile):
         super().__init__(filename, mode=mode, compression=compression, **kwargs)
 
     def distinfo_path(self, basename):
-        return f"{self._distinfo_dir}/{basename}"
+        return f"{self._distribution_prefix}.dist-info/{basename}"
+
+    def data_path(self, basename):
+        return f"{self._distribution_prefix}.data/{basename}"
 
     def add_file(self, package_filename, real_filename):
         """Add given file to the distribution."""
@@ -123,8 +129,8 @@ class _WhlFile(zipfile.ZipFile):
         def arcname_from(name):
             # Always use unix path separators.
             normalized_arcname = name.replace(os.path.sep, "/")
-            # Don't manipulate names filenames in the .distinfo directory.
-            if normalized_arcname.startswith(self._distinfo_dir):
+            # Don't manipulate names filenames in the .distinfo or .data directories.
+            if normalized_arcname.startswith(self._distribution_prefix):
                 return normalized_arcname
             for prefix in self._strip_path_prefixes:
                 if normalized_arcname.startswith(prefix):
@@ -204,14 +210,23 @@ class _WhlFile(zipfile.ZipFile):
         """Write RECORD file to the distribution."""
         record_path = self.distinfo_path("RECORD")
         entries = self._record + [(record_path, b"", b"")]
-        contents = b""
-        for filename, digest, size in entries:
-            if isinstance(filename, str):
-                filename = filename.lstrip("/").encode("utf-8", "surrogateescape")
-            contents += b"%s,%s,%s\n" % (filename, digest, size)
+        with io.StringIO() as contents_io:
+            writer = csv.writer(contents_io, lineterminator="\n")
+            for filename, digest, size in entries:
+                if isinstance(filename, str):
+                    filename = filename.lstrip("/")
+                writer.writerow(
+                    (
+                        c
+                        if isinstance(c, str)
+                        else c.decode("utf-8", "surrogateescape")
+                        for c in (filename, digest, size)
+                    )
+                )
 
-        self.add_string(record_path, contents)
-        return contents
+            contents = contents_io.getvalue()
+            self.add_string(record_path, contents)
+            return contents.encode("utf-8", "surrogateescape")
 
 
 class WheelMaker(object):
@@ -223,6 +238,7 @@ class WheelMaker(object):
         python_tag,
         abi,
         platform,
+        compress,
         outfile=None,
         strip_path_prefixes=None,
     ):
@@ -234,14 +250,13 @@ class WheelMaker(object):
         self._platform = platform
         self._outfile = outfile
         self._strip_path_prefixes = strip_path_prefixes
+        self._compress = compress
         self._wheelname_fragment_distribution_name = escape_filename_distribution_name(
             self._name
         )
-        self._distinfo_dir = (
-            self._wheelname_fragment_distribution_name
-            + "-"
-            + self._version
-            + ".dist-info/"
+
+        self._distribution_prefix = (
+            self._wheelname_fragment_distribution_name + "-" + self._version
         )
 
         self._whlfile = None
@@ -250,8 +265,9 @@ class WheelMaker(object):
         self._whlfile = _WhlFile(
             self.filename(),
             mode="w",
-            distinfo_dir=self._distinfo_dir,
+            distribution_prefix=self._distribution_prefix,
             strip_path_prefixes=self._strip_path_prefixes,
+            compression=zipfile.ZIP_DEFLATED if self._compress else zipfile.ZIP_STORED,
         )
         return self
 
@@ -279,6 +295,9 @@ class WheelMaker(object):
 
     def distinfo_path(self, basename):
         return self._whlfile.distinfo_path(basename)
+
+    def data_path(self, basename):
+        return self._whlfile.data_path(basename)
 
     def add_file(self, package_filename, real_filename):
         """Add given file to the distribution."""
@@ -384,6 +403,11 @@ def parse_args() -> argparse.Namespace:
         "--out", type=str, default=None, help="Override name of ouptut file"
     )
     output_group.add_argument(
+        "--no_compress",
+        action="store_true",
+        help="Disable compression of the final archive",
+    )
+    output_group.add_argument(
         "--name_file",
         type=Path,
         help="A file where the canonical name of the " "wheel will be written",
@@ -436,6 +460,12 @@ def parse_args() -> argparse.Namespace:
         help="'filename;real_path' pairs listing extra files to include in"
         "dist-info directory. Can be supplied multiple times.",
     )
+    contents_group.add_argument(
+        "--data_files",
+        action="append",
+        help="'filename;real_path' pairs listing data files to include in"
+        "data directory. Can be supplied multiple times.",
+    )
 
     build_group = parser.add_argument_group("Building requirements")
     build_group.add_argument(
@@ -452,25 +482,25 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args(sys.argv[1:])
 
 
+def _parse_file_pairs(content: List[str]) -> List[List[str]]:
+    """
+    Parse ; delimited lists of files into a 2D list.
+    """
+    return [i.split(";", maxsplit=1) for i in content or []]
+
+
 def main() -> None:
     arguments = parse_args()
 
-    if arguments.input_file:
-        input_files = [i.split(";") for i in arguments.input_file]
-    else:
-        input_files = []
+    input_files = _parse_file_pairs(arguments.input_file)
+    extra_distinfo_file = _parse_file_pairs(arguments.extra_distinfo_file)
+    data_files = _parse_file_pairs(arguments.data_files)
 
-    if arguments.extra_distinfo_file:
-        extra_distinfo_file = [i.split(";") for i in arguments.extra_distinfo_file]
-    else:
-        extra_distinfo_file = []
-
-    if arguments.input_file_list:
-        for input_file in arguments.input_file_list:
-            with open(input_file) as _file:
-                input_file_list = _file.read().splitlines()
-            for _input_file in input_file_list:
-                input_files.append(_input_file.split(";"))
+    for input_file in arguments.input_file_list:
+        with open(input_file) as _file:
+            input_file_list = _file.read().splitlines()
+        for _input_file in input_file_list:
+            input_files.append(_input_file.split(";"))
 
     all_files = get_files_to_package(input_files)
     # Sort the files for reproducible order in the archive.
@@ -505,6 +535,7 @@ def main() -> None:
         platform=arguments.platform,
         outfile=arguments.out,
         strip_path_prefixes=strip_prefixes,
+        compress=not arguments.no_compress,
     ) as maker:
         for package_filename, real_filename in all_files:
             maker.add_file(package_filename, real_filename)
@@ -526,9 +557,34 @@ def main() -> None:
 
         # Search for any `Requires-Dist` entries that refer to other files and
         # expand them.
+
+        def get_new_requirement_line(reqs_text, extra):
+            req = Requirement(reqs_text.strip())
+            if req.marker:
+                if extra:
+                    return f"Requires-Dist: {req.name}{req.specifier}; ({req.marker}) and {extra}"
+                else:
+                    return f"Requires-Dist: {req.name}{req.specifier}; {req.marker}"
+            else:
+                return f"Requires-Dist: {req.name}{req.specifier}; {extra}".strip(" ;")
+
         for meta_line in metadata.splitlines():
-            if not meta_line.startswith("Requires-Dist: @"):
+            if not meta_line.startswith("Requires-Dist: "):
                 continue
+
+            if not meta_line[len("Requires-Dist: ") :].startswith("@"):
+                # This is a normal requirement.
+                package, _, extra = meta_line[len("Requires-Dist: ") :].rpartition(";")
+                if not package:
+                    # This is when the package requirement does not have markers.
+                    continue
+                extra = extra.strip()
+                metadata = metadata.replace(
+                    meta_line, get_new_requirement_line(package, extra)
+                )
+                continue
+
+            # This is a requirement that refers to a file.
             file, _, extra = meta_line[len("Requires-Dist: @") :].partition(";")
             extra = extra.strip()
 
@@ -541,20 +597,7 @@ def main() -> None:
                 # Strip any comments
                 reqs_text, _, _ = reqs_text.partition("#")
 
-                req = Requirement(reqs_text.strip())
-                if req.marker:
-                    if extra:
-                        reqs.append(
-                            f"Requires-Dist: {req.name}{req.specifier}; ({req.marker}) and {extra}"
-                        )
-                    else:
-                        reqs.append(
-                            f"Requires-Dist: {req.name}{req.specifier}; {req.marker}"
-                        )
-                else:
-                    reqs.append(
-                        f"Requires-Dist: {req.name}{req.specifier}; {extra}".strip(" ;")
-                    )
+                reqs.append(get_new_requirement_line(reqs_text, extra))
 
             metadata = metadata.replace(meta_line, "\n".join(reqs))
 
@@ -570,6 +613,8 @@ def main() -> None:
             )
 
         # Sort the files for reproducible order in the archive.
+        for filename, real_path in sorted(data_files):
+            maker.add_file(maker.data_path(filename), real_path)
         for filename, real_path in sorted(extra_distinfo_file):
             maker.add_file(maker.distinfo_path(filename), real_path)
 

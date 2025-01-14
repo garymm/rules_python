@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""# Rules to generate Sphinx documentation.
+"""Rules to generate Sphinx documentation.
 
 The general usage of the Sphinx rules requires two pieces:
 
@@ -23,6 +23,8 @@ The general usage of the Sphinx rules requires two pieces:
 
 Defining your own `sphinx-build` binary is necessary because Sphinx uses
 a plugin model to support extensibility.
+
+The Sphinx integration is still experimental.
 """
 
 load(
@@ -30,8 +32,10 @@ load(
     _sphinx_build_binary = "sphinx_build_binary",
     _sphinx_docs = "sphinx_docs",
     _sphinx_inventory = "sphinx_inventory",
+    _sphinx_run = "sphinx_run",
 )
 
 sphinx_build_binary = _sphinx_build_binary
 sphinx_docs = _sphinx_docs
 sphinx_inventory = _sphinx_inventory
+sphinx_run = _sphinx_run
